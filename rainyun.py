@@ -449,7 +449,11 @@ def init_selenium(debug: bool, linux: bool) -> WebDriver:
         logger.debug("启用调试模式")
     
     if linux:
-        options.add_argument("--headless=new")
+        if os.environ.get("DISPLAY"):
+            logger.debug(f"使用虚拟显示器: {os.environ['DISPLAY']}")
+        else:
+            options.add_argument("--headless=new")
+            logger.debug("未检测到显示器，使用无头模式")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
@@ -558,14 +562,29 @@ def prepare_captcha_frame(ctx: RuntimeContext) -> None:
     ctx.driver.switch_to.default_content()
     frame = ctx.wait.until(EC.presence_of_element_located((By.ID, "tcaptcha_iframe_dy")))
 
-    rect = ctx.driver.execute_script(
-        """
-        const frame = arguments[0];
-        const rect = frame.getBoundingClientRect();
-        return {top: rect.top, left: rect.left, width: rect.width, height: rect.height};
-        """,
-        frame,
-    )
+    def get_frame_rect(_):
+        return ctx.driver.execute_script(
+            """
+            const rect = arguments[0].getBoundingClientRect();
+            return {top: rect.top, left: rect.left, width: rect.width, height: rect.height};
+            """,
+            frame,
+        )
+
+    try:
+        rect = WebDriverWait(ctx.driver, 10).until(
+            lambda driver: (
+                current
+                if (current := get_frame_rect(driver))["top"] > -1000
+                and current["left"] > -1000
+                and current["width"] > 0
+                and current["height"] > 0
+                else False
+            )
+        )
+    except TimeoutException:
+        rect = get_frame_rect(ctx.driver)
+
     if rect["top"] < 0 or rect["left"] < 0 or not rect["width"] or not rect["height"]:
         logger.warning(f"验证码窗口位于视口外，正在校正位置: {rect}")
         ctx.driver.execute_script(
@@ -588,6 +607,7 @@ def prepare_captcha_frame(ctx: RuntimeContext) -> None:
             """,
             frame,
         )
+        ctx.driver.execute_script("window.dispatchEvent(new Event('resize')); ")
 
     ctx.driver.switch_to.frame(frame)
     ctx.wait.until(EC.presence_of_element_located((By.ID, "tcWrap")))
