@@ -15,7 +15,7 @@ import cv2
 import ddddocr
 import requests
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver import ActionChains
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -449,7 +449,7 @@ def init_selenium(debug: bool, linux: bool) -> WebDriver:
         logger.debug("启用调试模式")
     
     if linux:
-        options.add_argument("--headless")
+        options.add_argument("--headless=new")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
@@ -553,6 +553,58 @@ def get_element_size(element) -> tuple[float, float]:
     return float(width), float(height)
 
 
+def prepare_captcha_frame(ctx: RuntimeContext) -> None:
+    """Wait for the Tencent captcha and keep it inside the headless viewport."""
+    ctx.driver.switch_to.default_content()
+    frame = ctx.wait.until(EC.presence_of_element_located((By.ID, "tcaptcha_iframe_dy")))
+
+    rect = ctx.driver.execute_script(
+        """
+        const frame = arguments[0];
+        const rect = frame.getBoundingClientRect();
+        return {top: rect.top, left: rect.left, width: rect.width, height: rect.height};
+        """,
+        frame,
+    )
+    if rect["top"] < 0 or rect["left"] < 0 or not rect["width"] or not rect["height"]:
+        logger.warning(f"验证码窗口位于视口外，正在校正位置: {rect}")
+        ctx.driver.execute_script(
+            """
+            const frame = arguments[0];
+            const values = {
+                display: "block",
+                visibility: "visible",
+                opacity: "1",
+                position: "fixed",
+                top: "20px",
+                left: "20px",
+                width: "400px",
+                height: "500px",
+                zIndex: "2147483647"
+            };
+            for (const [name, value] of Object.entries(values)) {
+                frame.style.setProperty(name, value, "important");
+            }
+            """,
+            frame,
+        )
+
+    ctx.driver.switch_to.frame(frame)
+    ctx.wait.until(EC.presence_of_element_located((By.ID, "tcWrap")))
+
+
+def refresh_captcha(ctx: RuntimeContext) -> bool:
+    """Refresh the challenge even when Selenium considers it off-screen."""
+    try:
+        reload_btn = ctx.wait.until(EC.presence_of_element_located((By.ID, "reload")))
+        ctx.driver.execute_script("arguments[0].click();", reload_btn)
+        time.sleep(2)
+        return True
+    except Exception as error:
+        logger.error(f"无法刷新验证码: {error}")
+        return False
+
+
 def process_captcha(ctx: RuntimeContext, retry_count: int = 0) -> bool:
     """处理验证码"""
     if retry_count >= CAPTCHA_RETRY_LIMIT:
@@ -606,7 +658,7 @@ def process_captcha(ctx: RuntimeContext, retry_count: int = 0) -> bool:
                     position = result[position_key]
                     logger.info(f"图案 {i + 1} 位于 ({position})，匹配率: {result[similarity_key]:.3f}")
                     
-                    slide_bg = ctx.wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
+                    slide_bg = ctx.wait.until(EC.presence_of_element_located((By.ID, "slideBg")))
                     style = slide_bg.get_attribute("style")
                     
                     x, y = int(position.split(",")[0]), int(position.split(",")[1])
@@ -622,16 +674,41 @@ def process_captcha(ctx: RuntimeContext, retry_count: int = 0) -> bool:
                     final_x = int(x_offset + x / width_raw * width)
                     final_y = int(y_offset + y / height_raw * height)
                     
-                    ActionChains(ctx.driver).move_to_element_with_offset(slide_bg, final_x, final_y).click().perform()
+                    try:
+                        ActionChains(ctx.driver).move_to_element_with_offset(
+                            slide_bg, final_x, final_y
+                        ).click().perform()
+                    except WebDriverException:
+                        target_x = x / width_raw * width
+                        target_y = y / height_raw * height
+                        ctx.driver.execute_script(
+                            """
+                            const element = arguments[0];
+                            const rect = element.getBoundingClientRect();
+                            const options = {
+                                bubbles: true,
+                                cancelable: true,
+                                view: window,
+                                clientX: rect.left + arguments[1],
+                                clientY: rect.top + arguments[2]
+                            };
+                            for (const type of ["mousemove", "mousedown", "mouseup", "click"]) {
+                                element.dispatchEvent(new MouseEvent(type, options));
+                            }
+                            """,
+                            slide_bg,
+                            target_x,
+                            target_y,
+                        )
                 
                 confirm = ctx.wait.until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="tcStatus"]/div[2]/div[2]/div/div'))
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".verify-btn.show"))
                 )
                 logger.info("提交验证码")
-                confirm.click()
+                ctx.driver.execute_script("arguments[0].click();", confirm)
                 time.sleep(5)
                 
-                result_el = ctx.wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="tcOperation"]')))
+                result_el = ctx.wait.until(EC.presence_of_element_located((By.ID, "tcOperation")))
                 if 'show-success' in result_el.get_attribute("class"):
                     logger.info("验证码通过")
                     return True
@@ -643,32 +720,24 @@ def process_captcha(ctx: RuntimeContext, retry_count: int = 0) -> bool:
             logger.error("当前验证码识别率低")
         
         # 刷新验证码重试
-        reload_btn = ctx.driver.find_element(By.XPATH, '//*[@id="reload"]')
-        time.sleep(2)
-        reload_btn.click()
-        time.sleep(2)
-        
-        return process_captcha(ctx, retry_count + 1)
+        if refresh_captcha(ctx):
+            return process_captcha(ctx, retry_count + 1)
+        return False
         
     except (TimeoutException, ValueError, CaptchaRetryableError) as e:
         logger.error(f"验证码处理异常: {type(e).__name__}: {e}")
         
-        try:
-            reload_btn = ctx.driver.find_element(By.XPATH, '//*[@id="reload"]')
-            time.sleep(2)
-            reload_btn.click()
-            time.sleep(2)
+        if refresh_captcha(ctx):
             return process_captcha(ctx, retry_count + 1)
-        except Exception as refresh_error:
-            logger.error(f"无法刷新验证码: {refresh_error}")
-            return False
+        return False
 
 
 def download_captcha_img(ctx: RuntimeContext):
     """下载验证码图片"""
     clear_temp_dir(ctx.temp_dir)
     
-    slide_bg = ctx.wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="slideBg"]')))
+    slide_bg = ctx.wait.until(EC.presence_of_element_located((By.ID, "slideBg")))
+    ctx.wait.until(lambda _: "url(" in (slide_bg.get_attribute("style") or ""))
     img1_style = slide_bg.get_attribute("style")
     img1_url = get_url_from_style(img1_style)
     
@@ -676,7 +745,8 @@ def download_captcha_img(ctx: RuntimeContext):
     if not download_image(img1_url, temp_path(ctx, "captcha.jpg")):
         raise CaptchaRetryableError("验证码背景图下载失败")
     
-    sprite = ctx.wait.until(EC.visibility_of_element_located((By.XPATH, '//*[@id="instruction"]/div/img')))
+    sprite = ctx.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#instruction img")))
+    ctx.wait.until(lambda _: bool(sprite.get_attribute("src")))
     img2_url = sprite.get_attribute("src")
     
     logger.info(f"下载验证码小图: {img2_url}")
@@ -854,7 +924,7 @@ def run():
         # 处理签到验证码
         logger.info("处理签到验证码")
         try:
-            ctx.driver.switch_to.frame("tcaptcha_iframe_dy")
+            prepare_captcha_frame(ctx)
             if not process_captcha(ctx):
                 logger.error("验证码处理失败")
                 raise Exception("签到验证码失败")
@@ -884,6 +954,7 @@ def run():
         
     except Exception as e:
         logger.critical(f"任务执行失败: {type(e).__name__}: {e}")
+        raise
         
     finally:
         # 清理资源
